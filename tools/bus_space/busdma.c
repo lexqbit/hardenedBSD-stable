@@ -29,6 +29,7 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -40,82 +41,111 @@ __FBSDID("$FreeBSD$");
 
 #include "../../sys/dev/proto/proto_dev.h"
 
-struct tag {
-	int	tid;
+struct obj {
+	int	oid;
+	u_int	type;
+#define	OBJ_TYPE_NONE	0
+#define	OBJ_TYPE_TAG	1
+#define	OBJ_TYPE_MD	2
+#define	OBJ_TYPE_SEG	3
 	u_int	refcnt;
 	int	fd;
-	struct tag *ptag;
+	struct obj *parent;
 	u_long	key;
-	u_long	align;
-	u_long	bndry;
-	u_long	maxaddr;
+	union {
+		struct {
+			unsigned long	align;
+			unsigned long	bndry;
+			unsigned long	maxaddr;
+			unsigned long	maxsz;
+			unsigned long	maxsegsz;
+			unsigned long	nsegs;
+			unsigned long	datarate;
+		} tag;
+		struct {
+			struct obj	*seg[3];
+			int		nsegs[3];
+#define	BUSDMA_MD_BUS	0
+#define	BUSDMA_MD_PHYS	1
+#define	BUSDMA_MD_VIRT	2
+		} md;
+		struct {
+			struct obj	*next;
+			unsigned long	address;
+			unsigned long	size;
+		} seg;
+	} u;
 };
 
-static struct tag **tidtbl = NULL;
-static int ntids = 0;
+static struct obj **oidtbl = NULL;
+static int noids = 0;
 
-static struct tag *
-tag_alloc(void)
+static struct obj *
+obj_alloc(u_int type)
 {
-	struct tag **newtbl, *tag;
-	int tid;
+	struct obj **newtbl, *obj;
+	int oid;
 
-	tag = malloc(sizeof(struct tag));
-	tag->refcnt = 0;
+	obj = calloc(1, sizeof(struct obj));
+	obj->type = type;
 
-	for (tid = 0; tid < ntids; tid++) {
-		if (tidtbl[tid] == 0)
+	for (oid = 0; oid < noids; oid++) {
+		if (oidtbl[oid] == 0)
 			break;
 	}
-	if (tid == ntids) {
-		newtbl = realloc(tidtbl, sizeof(struct tag *) * (ntids + 1));
+	if (oid == noids) {
+		newtbl = realloc(oidtbl, sizeof(struct obj *) * (noids + 1));
 		if (newtbl == NULL) {
-			free(tag);
+			free(obj);
 			return (NULL);
 		}
-		tidtbl = newtbl;
-		ntids++;
+		oidtbl = newtbl;
+		noids++;
 	}
-	tidtbl[tid] = tag;
-	tag->tid = tid;
-	return (tag);
+	oidtbl[oid] = obj;
+	obj->oid = oid;
+	return (obj);
 }
 
 static int
-tag_free(struct tag *tag)
+obj_free(struct obj *obj)
 {
 
-	tidtbl[tag->tid] = NULL;
-	free(tag);
+	oidtbl[obj->oid] = NULL;
+	free(obj);
 	return (0);
 }
 
-static struct tag *
-tid_lookup(int tid)
+static struct obj *
+obj_lookup(int oid, u_int type)
 {
-	struct tag *tag;
+	struct obj *obj;
 
-	if (tid < 0 || tid >= ntids) {
+	if (oid < 0 || oid >= noids) {
 		errno = EINVAL;
 		return (NULL);
 	}
-	tag = tidtbl[tid];
-	if (tag->refcnt == 0) {
+	obj = oidtbl[oid];
+	if (obj->refcnt == 0) {
 		errno = ENXIO;
 		return (NULL);
 	}
-	return (tag);
+	if (type != OBJ_TYPE_NONE && obj->type != type) {
+		errno = ENODEV;
+		return (NULL);
+	}
+	return (obj);
 }
 
-struct tag *
-bd_tag_new(struct tag *ptag, int fd, u_long align, u_long bndry,
+struct obj *
+bd_tag_new(struct obj *ptag, int fd, u_long align, u_long bndry,
     u_long maxaddr, u_long maxsz, u_int nsegs, u_long maxsegsz,
     u_int datarate, u_int flags)
 {
 	struct proto_ioc_busdma ioc;
-	struct tag *tag;
+	struct obj *tag;
 
-	tag = tag_alloc();
+	tag = obj_alloc(OBJ_TYPE_TAG);
 	if (tag == NULL)
 		return (NULL);
 
@@ -132,16 +162,20 @@ bd_tag_new(struct tag *ptag, int fd, u_long align, u_long bndry,
 	ioc.u.tag.datarate = datarate;
 	ioc.u.tag.flags = flags;
 	if (ioctl(fd, PROTO_IOC_BUSDMA, &ioc) == -1) {
-		tag_free(tag);
+		obj_free(tag);
 		return (NULL);
 	}
 	tag->refcnt = 1;
 	tag->fd = fd;
-	tag->ptag = ptag;
-	tag->key = ioc.key;
-	tag->align = ioc.u.tag.align;
-	tag->bndry = ioc.u.tag.bndry;
-	tag->maxaddr = ioc.u.tag.maxaddr;
+	tag->parent = ptag;
+	tag->key = ioc.result;
+	tag->u.tag.align = ioc.u.tag.align;
+	tag->u.tag.bndry = ioc.u.tag.bndry;
+	tag->u.tag.maxaddr = ioc.u.tag.maxaddr;
+	tag->u.tag.maxsz = ioc.u.tag.maxsz;
+	tag->u.tag.maxsegsz = ioc.u.tag.maxsegsz;
+	tag->u.tag.nsegs = ioc.u.tag.nsegs;
+	tag->u.tag.datarate = ioc.u.tag.datarate;
 	return (tag);
 }
 
@@ -149,7 +183,7 @@ int
 bd_tag_create(const char *dev, u_long align, u_long bndry, u_long maxaddr,
     u_long maxsz, u_int nsegs, u_long maxsegsz, u_int datarate, u_int flags)
 {
-	struct tag *tag;
+	struct obj *tag;
 	int fd;
 
 	fd = open(dev, O_RDWR);
@@ -162,16 +196,16 @@ bd_tag_create(const char *dev, u_long align, u_long bndry, u_long maxaddr,
 		close(fd);
 		return (-1);
 	}
-	return (tag->tid);
+	return (tag->oid);
 }
 
 int
 bd_tag_derive(int ptid, u_long align, u_long bndry, u_long maxaddr,
     u_long maxsz, u_int nsegs, u_long maxsegsz, u_int datarate, u_int flags)
 {
-	struct tag *ptag, *tag;
+	struct obj *ptag, *tag;
 
-	ptag = tid_lookup(ptid);
+	ptag = obj_lookup(ptid, OBJ_TYPE_TAG);
 	if (ptag == NULL)
 		return (-1);
 
@@ -179,20 +213,17 @@ bd_tag_derive(int ptid, u_long align, u_long bndry, u_long maxaddr,
 	    maxsegsz, datarate, flags);
 	if (tag == NULL)
 		return (-1);
-	while (ptag != NULL) {
-		ptag->refcnt++;
-		ptag = ptag->ptag;
-	}
-	return (tag->tid);
+	ptag->refcnt++;
+	return (tag->oid);
 }
 
 int
 bd_tag_destroy(int tid)
 {
 	struct proto_ioc_busdma ioc;
-	struct tag *ptag, *tag;
+	struct obj *ptag, *tag;
 
-	tag = tid_lookup(tid);
+	tag = obj_lookup(tid, OBJ_TYPE_TAG);
 	if (tag == NULL)
 		return (errno);
 	if (tag->refcnt > 1)
@@ -204,15 +235,167 @@ bd_tag_destroy(int tid)
 	if (ioctl(tag->fd, PROTO_IOC_BUSDMA, &ioc) == -1)
 		return (errno);
 
-	ptag = tag->ptag;
-	if (ptag == NULL)
+	if (tag->parent != NULL)
+		tag->parent->refcnt--;
+	else
 		close(tag->fd);
-	else {
-		do {
-			ptag->refcnt--;
-			ptag = ptag->ptag;
-		} while (ptag != NULL);
+	obj_free(tag);
+	return (0);
+}
+
+int
+bd_mem_alloc(int tid, u_int flags)
+{
+	struct proto_ioc_busdma ioc;
+	struct obj *md, *tag;
+	struct obj *bseg, *pseg, *vseg;
+
+	tag = obj_lookup(tid, OBJ_TYPE_TAG);
+	if (tag == NULL)
+		return (-1);
+
+	md = obj_alloc(OBJ_TYPE_MD);
+	if (md == NULL)
+		return (-1);
+
+	memset(&ioc, 0, sizeof(ioc));
+	ioc.request = PROTO_IOC_BUSDMA_MEM_ALLOC;
+	ioc.u.mem.tag = tag->key;
+	ioc.u.mem.flags = flags;
+	if (ioctl(tag->fd, PROTO_IOC_BUSDMA, &ioc) == -1) {
+		obj_free(md);
+		return (-1);
 	}
-	tag_free(tag);
+
+	md->refcnt = 1;
+	md->fd = tag->fd;
+	md->parent = tag;
+	tag->refcnt++;
+	md->key = ioc.result;
+
+	assert(ioc.u.mem.phys_nsegs == 1);
+	pseg = obj_alloc(OBJ_TYPE_SEG);
+	pseg->refcnt = 1;
+	pseg->parent = md;
+	pseg->u.seg.address = ioc.u.mem.phys_addr;
+	pseg->u.seg.size = tag->u.tag.maxsz;
+	md->u.md.seg[BUSDMA_MD_PHYS] = pseg;
+	md->u.md.nsegs[BUSDMA_MD_PHYS] = ioc.u.mem.phys_nsegs;
+
+	assert(ioc.u.mem.bus_nsegs == 1);
+	bseg = obj_alloc(OBJ_TYPE_SEG);
+	bseg->refcnt = 1;
+	bseg->parent = md;
+	bseg->u.seg.address = ioc.u.mem.bus_addr;
+	bseg->u.seg.size = tag->u.tag.maxsz;
+	md->u.md.seg[BUSDMA_MD_BUS] = bseg;
+	md->u.md.nsegs[BUSDMA_MD_BUS] = ioc.u.mem.bus_nsegs;
+
+	vseg = obj_alloc(OBJ_TYPE_SEG);
+	vseg->refcnt = 1;
+	vseg->parent = md;
+	vseg->u.seg.address = (uintptr_t)mmap(NULL, pseg->u.seg.size,
+	    PROT_READ | PROT_WRITE, MAP_NOCORE | MAP_SHARED, md->fd,
+	    pseg->u.seg.address);
+	vseg->u.seg.size = pseg->u.seg.size;
+	md->u.md.seg[BUSDMA_MD_VIRT] = vseg;
+	md->u.md.nsegs[BUSDMA_MD_VIRT] = 1;
+
+	return (md->oid);
+}
+
+int
+bd_mem_free(int mdid)
+{
+	struct proto_ioc_busdma ioc;
+	struct obj *md, *seg;
+
+	md = obj_lookup(mdid, OBJ_TYPE_MD);
+	if (md == NULL)
+		return (errno);
+
+	for (seg = md->u.md.seg[BUSDMA_MD_VIRT];
+	    seg != NULL;
+	    seg = seg->u.seg.next)
+		munmap((void *)seg->u.seg.address, seg->u.seg.size);
+	memset(&ioc, 0, sizeof(ioc));
+	ioc.request = PROTO_IOC_BUSDMA_MEM_FREE;
+	ioc.key = md->key;
+	if (ioctl(md->fd, PROTO_IOC_BUSDMA, &ioc) == -1)
+		return (errno);
+
+	md->parent->refcnt--;
+	obj_free(md);
+	return (0);
+}
+
+int
+bd_md_first_seg(int mdid, int space)
+{
+	struct obj *md, *seg;
+
+	md = obj_lookup(mdid, OBJ_TYPE_MD);
+	if (md == NULL)
+		return (-1);
+
+	if (space != BUSDMA_MD_BUS && space != BUSDMA_MD_PHYS &&
+	    space != BUSDMA_MD_VIRT) {
+		errno = EINVAL;
+		return (-1);
+	}
+	seg = md->u.md.seg[space];
+	if (seg == NULL) {
+		errno = ENXIO;
+		return (-1);
+	}
+	return (seg->oid);
+}
+
+int
+bd_md_next_seg(int mdid, int sid)
+{
+	struct obj *seg;
+
+	seg = obj_lookup(sid, OBJ_TYPE_SEG);
+	if (seg == NULL)
+		return (-1);
+
+	seg = seg->u.seg.next;
+	if (seg == NULL) {
+		errno = ENXIO;
+		return (-1);
+	}
+	return (seg->oid);
+}
+
+int
+bd_seg_get_addr(int sid, u_long *addr_p)
+{
+	struct obj *seg;
+
+	if (addr_p == NULL)
+		return (EINVAL);
+
+	seg = obj_lookup(sid, OBJ_TYPE_SEG);
+	if (seg == NULL)
+		return (errno);
+
+	*addr_p = seg->u.seg.address;
+	return (0);
+}
+
+int
+bd_seg_get_size(int sid, u_long *size_p)
+{
+	struct obj *seg;
+
+	if (size_p == NULL)
+		return (EINVAL);
+
+	seg = obj_lookup(sid, OBJ_TYPE_SEG);
+	if (seg == NULL)
+		return (errno);
+
+	*size_p = seg->u.seg.size;
 	return (0);
 }

@@ -33,6 +33,7 @@ static const char rcsid[] =
 #include <fcntl.h>
 #include <locale.h>
 #include <paths.h>
+#include <stdbool.h>
 #include <sys/wait.h>
 #include "pw.h"
 
@@ -84,6 +85,8 @@ struct pwf VPWF =
 	vgetgrnam,
 };
 
+struct pwconf conf;
+
 static struct cargs arglist;
 
 static int      getindex(const char *words[], const char *word);
@@ -96,12 +99,12 @@ main(int argc, char *argv[])
 	int             ch;
 	int             mode = -1;
 	int             which = -1;
+	long		id = -1;
 	char		*config = NULL;
-	struct userconf *cnf;
 	struct stat	st;
-	char		arg;
-	struct carg	*carg;
-	char		*etcpath = NULL;
+	const char	*errstr;
+	char		arg, *name;
+	bool		relocated, nis;
 
 	static const char *opts[W_NUM][M_NUM] =
 	{
@@ -123,11 +126,17 @@ main(int argc, char *argv[])
 		 }
 	};
 
-	static int      (*funcs[W_NUM]) (struct userconf * _cnf, int _mode, struct cargs * _args) =
+	static int      (*funcs[W_NUM]) (int _mode, char *_name, long _id,
+	    struct cargs * _args) =
 	{			/* Request handlers */
 		pw_user,
 		pw_group
 	};
+
+	name = NULL;
+	relocated = nis = false;
+	memset(&conf, 0, sizeof(conf));
+	strlcpy(conf.etcpath, _PATH_PWD, sizeof(conf.etcpath));
 
 	LIST_INIT(&arglist);
 
@@ -146,6 +155,10 @@ main(int argc, char *argv[])
 			 */
 			arg = argv[1][1];
 			if (arg == 'V' || arg == 'R') {
+				if (relocated)
+					errx(EXIT_FAILURE, "Both '-R' and '-V' "
+					    "specified, only one accepted");
+				relocated = true;
 				optarg = &argv[1][2];
 				if (*optarg == '\0') {
 					if (stat(argv[2], &st) != 0)
@@ -159,7 +172,14 @@ main(int argc, char *argv[])
 					++argv;
 					--argc;
 				}
-				addarg(&arglist, arg, optarg);
+				memcpy(&PWF, &VPWF, sizeof PWF);
+				if (arg == 'R') {
+					strlcpy(conf.rootdir, optarg,
+					    sizeof(conf.rootdir));
+					PWF._altdir = PWF_ROOTDIR;
+				}
+				snprintf(conf.etcpath, sizeof(conf.etcpath),
+				    "%s%s", optarg, arg == 'R' ? "/etc" : "");
 			} else
 				break;
 		}
@@ -174,9 +194,15 @@ main(int argc, char *argv[])
 			mode = tmp % M_NUM;
 		} else if (strcmp(argv[1], "help") == 0 && argv[2] == NULL)
 			cmdhelp(mode, which);
-		else if (which != -1 && mode != -1)
-			addarg(&arglist, 'n', argv[1]);
-		else
+		else if (which != -1 && mode != -1) {
+			if (strspn(argv[1], "0123456789") == strlen(argv[1])) {
+				id = strtonum(argv[1], 0, LONG_MAX, &errstr);
+				if (errstr != NULL)
+					errx(EX_USAGE, "Bad id '%s': %s",
+					    argv[1], errstr);
+			} else
+				name = argv[1];
+		} else
 			errx(EX_USAGE, "unknown keyword `%s'", argv[1]);
 		++argv;
 		--argc;
@@ -195,17 +221,82 @@ main(int argc, char *argv[])
 	optarg = NULL;
 
 	while ((ch = getopt(argc, argv, opts[which][mode])) != -1) {
-		if (ch == '?')
+		switch (ch) {
+		case '?':
 			errx(EX_USAGE, "unknown switch");
-		else
+			break;
+		case '7':
+			conf.v7 = true;
+			break;
+		case 'C':
+			conf.config = optarg;
+			config = conf.config;
+			break;
+		case 'N':
+			conf.dryrun = true;
+			break;
+		case 'l':
+			if (strlen(optarg) >= MAXLOGNAME)
+				errx(EX_USAGE, "new name too long: %s", optarg);
+			conf.newname = optarg;
+			break;
+		case 'P':
+			conf.pretty = true;
+			break;
+		case 'Y':
+			nis = true;
+			break;
+		case 'g':
+			if (which == 0) { /* for user* */
+				addarg(&arglist, 'g', optarg);
+				break;
+			}
+			if (strspn(optarg, "0123456789") != strlen(optarg))
+				errx(EX_USAGE, "-g expects a number");
+			id = strtonum(optarg, 0, LONG_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE, "Bad id '%s': %s", optarg,
+				    errstr);
+			break;
+		case 'u':
+			if (strspn(optarg, "0123456789,") != strlen(optarg))
+				errx(EX_USAGE, "-u expects a number");
+			if (strchr(optarg, ',') != NULL) {
+				addarg(&arglist, 'u', optarg);
+				break;
+			}
+			id = strtonum(optarg, 0, LONG_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE, "Bad id '%s': %s", optarg,
+				    errstr);
+			break;
+		case 'n':
+			if (strspn(optarg, "0123456789") != strlen(optarg)) {
+				name = optarg;
+				break;
+			}
+			id = strtonum(optarg, 0, LONG_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE, "Bad id '%s': %s", optarg,
+				    errstr);
+			break;
+		case 'o':
+			conf.checkduplicate = true;
+			break;
+		default:
 			addarg(&arglist, ch, optarg);
+			break;
+		}
 		optarg = NULL;
 	}
+
+	if (name != NULL && strlen(name) >= MAXLOGNAME)
+		errx(EX_USAGE, "name too long: %s", name);
 
 	/*
 	 * Must be root to attempt an update
 	 */
-	if (geteuid() != 0 && mode != M_PRINT && mode != M_NEXT && getarg(&arglist, 'N')==NULL)
+	if (geteuid() != 0 && mode != M_PRINT && mode != M_NEXT && !conf.dryrun)
 		errx(EX_NOPERM, "you must be root to run this program");
 
 	/*
@@ -219,44 +310,24 @@ main(int argc, char *argv[])
 	 * Set our base working path if not overridden
 	 */
 
-	config = getarg(&arglist, 'C') ? getarg(&arglist, 'C')->val : NULL;
-
-	if ((carg = getarg(&arglist, 'R')) != NULL) {
-		asprintf(&etcpath, "%s/etc", carg->val);
-		if (etcpath == NULL)
+	if (config == NULL) {	/* Only override config location if -C not specified */
+		asprintf(&config, "%s/pw.conf", conf.etcpath);
+		if (config == NULL)
 			errx(EX_OSERR, "out of memory");
 	}
-	if (etcpath == NULL && (carg = getarg(&arglist, 'V')) != NULL) {
-		etcpath = strdup(carg->val);
-		if (etcpath == NULL)
-			errx(EX_OSERR, "out of memory");
-	}
-	if (etcpath && *etcpath) {
-		if (config == NULL) {	/* Only override config location if -C not specified */
-			asprintf(&config, "%s/pw.conf", etcpath);
-			if (config == NULL)
-				 errx(EX_OSERR, "out of memory");
-		}
-		setpwdir(etcpath);
-		setgrdir(etcpath);
-		memcpy(&PWF, &VPWF, sizeof PWF);
-		if (getarg(&arglist, 'R'))
-			PWF._altdir = PWF_ROOTDIR;
-	}
-	free(etcpath);
 
 	/*
 	 * Now, let's do the common initialisation
 	 */
-	cnf = read_userconfig(config);
+	conf.userconf = read_userconfig(config);
 
-	ch = funcs[which] (cnf, mode, &arglist);
+	ch = funcs[which] (mode, name, id, &arglist);
 
 	/*
 	 * If everything went ok, and we've been asked to update
 	 * the NIS maps, then do it now
 	 */
-	if (ch == EXIT_SUCCESS && getarg(&arglist, 'Y') != NULL) {
+	if (ch == EXIT_SUCCESS && nis) {
 		pid_t	pid;
 
 		fflush(NULL);
@@ -274,7 +345,7 @@ main(int argc, char *argv[])
 			if ((i = WEXITSTATUS(i)) != 0)
 				errx(ch, "make exited with status %d", i);
 			else
-				pw_log(cnf, mode, which, "NIS maps updated");
+				pw_log(conf.userconf, mode, which, "NIS maps updated");
 		}
 	}
 	return ch;
