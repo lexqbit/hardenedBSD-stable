@@ -751,13 +751,12 @@ kern_proc_setrlimit(struct thread *td, struct proc *p, u_int which,
 			if (limp->rlim_cur > oldssiz.rlim_cur) {
 				prot = p->p_sysent->sv_stackprot;
 				size = limp->rlim_cur - oldssiz.rlim_cur;
-				addr = p->p_sysent->sv_usrstack -
-				    limp->rlim_cur;
+				addr = p->p_usrstack - limp->rlim_cur;
+				// XXXOP NOEXEC NX here
 			} else {
 				prot = VM_PROT_NONE;
 				size = oldssiz.rlim_cur - limp->rlim_cur;
-				addr = p->p_sysent->sv_usrstack -
-				    oldssiz.rlim_cur;
+				addr = p->p_usrstack - oldssiz.rlim_cur;
 			}
 			addr = trunc_page(addr);
 			size = round_page(size);
@@ -1371,6 +1370,24 @@ ui_racct_foreach(void (*callback)(struct racct *racct,
 }
 #endif
 
+static inline int
+chglimit(struct uidinfo *uip, long *limit, int diff, rlim_t max, const char *name)
+{
+
+	/* Don't allow them to exceed max, but allow subtraction. */
+	if (diff > 0 && max != 0) {
+		if (atomic_fetchadd_long(limit, (long)diff) + diff > max) {
+			atomic_subtract_long(limit, (long)diff);
+			return (0);
+		}
+	} else {
+		atomic_add_long(limit, (long)diff);
+		if (*limit < 0)
+			printf("negative %s for uid = %d\n", name, uip->ui_uid);
+	}
+	return (1);
+}
+
 /*
  * Change the count associated with number of processes
  * a given user is using.  When 'max' is 0, don't enforce a limit
@@ -1379,18 +1396,7 @@ int
 chgproccnt(struct uidinfo *uip, int diff, rlim_t max)
 {
 
-	/* Don't allow them to exceed max, but allow subtraction. */
-	if (diff > 0 && max != 0) {
-		if (atomic_fetchadd_long(&uip->ui_proccnt, (long)diff) + diff > max) {
-			atomic_subtract_long(&uip->ui_proccnt, (long)diff);
-			return (0);
-		}
-	} else {
-		atomic_add_long(&uip->ui_proccnt, (long)diff);
-		if (uip->ui_proccnt < 0)
-			printf("negative proccnt for uid = %d\n", uip->ui_uid);
-	}
-	return (1);
+	return (chglimit(uip, &uip->ui_proccnt, diff, max, "proccnt"));
 }
 
 /*
@@ -1399,21 +1405,17 @@ chgproccnt(struct uidinfo *uip, int diff, rlim_t max)
 int
 chgsbsize(struct uidinfo *uip, u_int *hiwat, u_int to, rlim_t max)
 {
-	int diff;
+	int diff, rv;
 
 	diff = to - *hiwat;
-	if (diff > 0) {
-		if (atomic_fetchadd_long(&uip->ui_sbsize, (long)diff) + diff > max) {
-			atomic_subtract_long(&uip->ui_sbsize, (long)diff);
-			return (0);
-		}
+	if (diff > 0 && max == 0) {
+		rv = 0;
 	} else {
-		atomic_add_long(&uip->ui_sbsize, (long)diff);
-		if (uip->ui_sbsize < 0)
-			printf("negative sbsize for uid = %d\n", uip->ui_uid);
+		rv = chglimit(uip, &uip->ui_sbsize, diff, max, "sbsize");
+		if (rv != 0)
+			*hiwat = to;
 	}
-	*hiwat = to;
-	return (1);
+	return (rv);
 }
 
 /*
@@ -1424,36 +1426,14 @@ int
 chgptscnt(struct uidinfo *uip, int diff, rlim_t max)
 {
 
-	/* Don't allow them to exceed max, but allow subtraction. */
-	if (diff > 0 && max != 0) {
-		if (atomic_fetchadd_long(&uip->ui_ptscnt, (long)diff) + diff > max) {
-			atomic_subtract_long(&uip->ui_ptscnt, (long)diff);
-			return (0);
-		}
-	} else {
-		atomic_add_long(&uip->ui_ptscnt, (long)diff);
-		if (uip->ui_ptscnt < 0)
-			printf("negative ptscnt for uid = %d\n", uip->ui_uid);
-	}
-	return (1);
+	return (chglimit(uip, &uip->ui_ptscnt, diff, max, "ptscnt"));
 }
 
 int
 chgkqcnt(struct uidinfo *uip, int diff, rlim_t max)
 {
 
-	if (diff > 0 && max != 0) {
-		if (atomic_fetchadd_long(&uip->ui_kqcnt, (long)diff) +
-		    diff > max) {
-			atomic_subtract_long(&uip->ui_kqcnt, (long)diff);
-			return (0);
-		}
-	} else {
-		atomic_add_long(&uip->ui_kqcnt, (long)diff);
-		if (uip->ui_kqcnt < 0)
-			printf("negative kqcnt for uid = %d\n", uip->ui_uid);
-	}
-	return (1);
+	return (chglimit(uip, &uip->ui_kqcnt, diff, max, "kqcnt"));
 }
 
 void

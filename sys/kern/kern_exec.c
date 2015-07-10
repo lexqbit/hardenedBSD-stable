@@ -138,12 +138,12 @@ sysctl_kern_ps_strings(SYSCTL_HANDLER_ARGS)
 #ifdef SCTL_MASK32
 	if (req->flags & SCTL_MASK32) {
 		unsigned int val;
-		val = (unsigned int)p->p_sysent->sv_psstrings;
+		val = (unsigned int)p->p_psstrings;
 		error = SYSCTL_OUT(req, &val, sizeof(val));
 	} else
 #endif
-		error = SYSCTL_OUT(req, &p->p_sysent->sv_psstrings,
-		   sizeof(p->p_sysent->sv_psstrings));
+		error = SYSCTL_OUT(req, &p->p_psstrings,
+		   sizeof(p->p_psstrings));
 	return error;
 }
 
@@ -157,12 +157,12 @@ sysctl_kern_usrstack(SYSCTL_HANDLER_ARGS)
 #ifdef SCTL_MASK32
 	if (req->flags & SCTL_MASK32) {
 		unsigned int val;
-		val = (unsigned int)p->p_sysent->sv_usrstack;
+		val = (unsigned int)p->p_usrstack;
 		error = SYSCTL_OUT(req, &val, sizeof(val));
 	} else
 #endif
-		error = SYSCTL_OUT(req, &p->p_sysent->sv_usrstack,
-		    sizeof(p->p_sysent->sv_usrstack));
+		error = SYSCTL_OUT(req, &p->p_usrstack,
+		    sizeof(p->p_usrstack));
 	return error;
 }
 
@@ -586,6 +586,10 @@ interpret:
 		goto exec_fail_dealloc;
 	}
 
+	p->p_psstrings = p->p_sysent->sv_psstrings;
+#ifdef PAX_ASLR
+	pax_aslr_stack_with_gap(p, &(p->p_psstrings));
+#endif
 	/*
 	 * Copy out strings (args and env) and initialize stack base
 	 */
@@ -990,13 +994,10 @@ exec_map_first_page(imgp)
 		}
 		initial_pagein = i;
 		rv = vm_pager_get_pages(object, ma, initial_pagein, 0);
-		ma[0] = vm_page_lookup(object, 0);
-		if ((rv != VM_PAGER_OK) || (ma[0] == NULL)) {
-			if (ma[0] != NULL) {
-				vm_page_lock(ma[0]);
-				vm_page_free(ma[0]);
-				vm_page_unlock(ma[0]);
-			}
+		if (rv != VM_PAGER_OK) {
+			vm_page_lock(ma[0]);
+			vm_page_free(ma[0]);
+			vm_page_unlock(ma[0]);
 			VM_OBJECT_WUNLOCK(object);
 			return (EIO);
 		}
@@ -1084,12 +1085,29 @@ exec_new_vmspace(imgp, sv)
 	/* Map a shared page */
 	obj = sv->sv_shared_page_obj;
 	if (obj != NULL) {
+		p->p_shared_page_base=sv->sv_shared_page_base;
+#ifdef PAX_ASLR
+		PROC_LOCK(imgp->proc);
+		pax_aslr_vdso(p, &(p->p_shared_page_base));
+		PROC_UNLOCK(imgp->proc);
+#endif
 		vm_object_reference(obj);
-		error = vm_map_fixed(map, obj, 0,
-		    sv->sv_shared_page_base, sv->sv_shared_page_len,
-		    VM_PROT_READ | VM_PROT_EXECUTE,
-		    VM_PROT_READ | VM_PROT_EXECUTE,
-		    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
+		if (p->p_shared_page_base != sv->sv_shared_page_base) {
+			/* Only use vm_map_find if ASLR is active */
+			error = vm_map_find(map, obj, 0,
+			    &(p->p_shared_page_base), sv->sv_shared_page_len,
+			    sv->sv_shared_page_base,
+			    VMFS_ANY_SPACE,
+			    VM_PROT_READ | VM_PROT_EXECUTE,
+			    VM_PROT_READ | VM_PROT_EXECUTE,
+			    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
+		} else {
+			error = vm_map_fixed(map, obj, 0,
+			    p->p_shared_page_base, sv->sv_shared_page_len,
+			    VM_PROT_READ | VM_PROT_EXECUTE,
+			    VM_PROT_READ | VM_PROT_EXECUTE,
+			    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
+		}
 		if (error) {
 			vm_object_deallocate(obj);
 			return (error);
@@ -1113,15 +1131,16 @@ exec_new_vmspace(imgp, sv)
 	} else {
 		ssiz = maxssiz;
 	}
+
+	stack_addr = sv->sv_usrstack;
 #ifdef PAX_ASLR
-	/*
-	 *  The current stack randomization based on gap.
-	 *  To fix the mapping, we should increase the allocatable
-	 *  stack size with the gap size.
-	 */
-	pax_aslr_stack_adjust(p, &ssiz);
+	/* Randomize the stack top. */
+	pax_aslr_stack(p, &stack_addr);
 #endif
-	stack_addr = sv->sv_usrstack - ssiz;
+	/* Save the process specific randomized stack top. */
+	p->p_usrstack = stack_addr;
+	/* Calculate the stack's mapping address.  */
+	stack_addr -= ssiz;
 	error = vm_map_stack(map, stack_addr, (vm_size_t)ssiz,
 	    obj != NULL && imgp->stack_prot != 0 ? imgp->stack_prot :
 		sv->sv_stackprot,
@@ -1134,7 +1153,7 @@ exec_new_vmspace(imgp, sv)
 	 * are still used to enforce the stack rlimit on the process stack.
 	 */
 	vmspace->vm_ssize = sgrowsiz >> PAGE_SHIFT;
-	vmspace->vm_maxsaddr = (char *)sv->sv_usrstack - ssiz;
+	vmspace->vm_maxsaddr = (char *)stack_addr;
 
 	return (0);
 }
@@ -1296,15 +1315,18 @@ exec_copyout_strings(imgp)
 		execpath_len = 0;
 	p = imgp->proc;
 	szsigcode = 0;
-	arginfo = (struct ps_strings *)p->p_sysent->sv_psstrings;
-	if (p->p_sysent->sv_sigcode_base == 0) {
+	p->p_sigcode_base = p->p_sysent->sv_sigcode_base;
+	arginfo = (struct ps_strings *)p->p_psstrings;
+	if (p->p_sigcode_base == 0) {
 		if (p->p_sysent->sv_szsigcode != NULL)
 			szsigcode = *(p->p_sysent->sv_szsigcode);
+#ifdef PAX_ASLR
+	} else {
+		// XXXOP
+		pax_aslr_vdso(p, &(p->p_sigcode_base));
+#endif
 	}
 	destp =	(uintptr_t)arginfo;
-#ifdef PAX_ASLR
-	pax_aslr_stack(p, &destp);
-#endif
 
 	/*
 	 * install sigcode

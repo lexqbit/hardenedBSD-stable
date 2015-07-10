@@ -137,6 +137,7 @@ main(int argc, char *argv[])
 	relocated = nis = false;
 	memset(&conf, 0, sizeof(conf));
 	strlcpy(conf.etcpath, _PATH_PWD, sizeof(conf.etcpath));
+	conf.fd = -1;
 
 	LIST_INIT(&arglist);
 
@@ -214,6 +215,7 @@ main(int argc, char *argv[])
 	if (mode == -1 || which == -1)
 		cmdhelp(mode, which);
 
+	conf.which = which;
 	/*
 	 * We know which mode we're in and what we're about to do, so now
 	 * let's dispatch the remaining command line args in a genric way.
@@ -279,6 +281,35 @@ main(int argc, char *argv[])
 			if (errstr != NULL)
 				errx(EX_USAGE, "Bad id '%s': %s", optarg,
 				    errstr);
+			break;
+		case 'H':
+			if (conf.fd != -1)
+				errx(EX_USAGE, "'-h' and '-H' are mutually "
+				    "exclusive options");
+			conf.precrypted = true;
+			if (strspn(optarg, "0123456789") != strlen(optarg))
+				errx(EX_USAGE, "'-H' expects a file descriptor");
+
+			conf.fd = strtonum(optarg, 0, INT_MAX, &errstr);
+			if (errstr != NULL)
+				errx(EX_USAGE, "Bad file descriptor '%s': %s",
+				    optarg, errstr);
+			break;
+		case 'h':
+			if (conf.fd != -1)
+				errx(EX_USAGE, "'-h' and '-H' are mutually "
+				    "exclusive options");
+
+			if (strcmp(optarg, "-") == 0)
+				conf.fd = '-';
+			else if (strspn(optarg, "0123456789") == strlen(optarg)) {
+				conf.fd = strtonum(optarg, 0, INT_MAX, &errstr);
+				if (errstr != NULL)
+					errx(EX_USAGE, "'-h' expects a "
+					    "file descriptor or '-'");
+			} else
+				errx(EX_USAGE, "'-h' expects a file "
+				    "descriptor or '-'");
 			break;
 		case 'o':
 			conf.checkduplicate = true;

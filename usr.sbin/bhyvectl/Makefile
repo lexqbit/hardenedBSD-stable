@@ -7,7 +7,8 @@ SRCS=	bhyvectl.c
 
 MAN=
 
-LIBADD=	vmmapi
+LIBADD=	vmmapi util
+WANTS_PIE=	yes
 
 WARNS?=	3
 

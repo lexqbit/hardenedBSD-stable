@@ -1337,7 +1337,7 @@ kern_jail_set(struct thread *td, struct uio *optuio, int flags)
 
 		pr->pr_securelevel = ppr->pr_securelevel;
 		pr->pr_allow = JAIL_DEFAULT_ALLOW & ppr->pr_allow;
-		pr->pr_enforce_statfs = JAIL_DEFAULT_ENFORCE_STATFS;
+		pr->pr_enforce_statfs = jail_default_enforce_statfs;
 		pr->pr_devfs_rsnum = ppr->pr_devfs_rsnum;
 
 		pr->pr_osreldate = osreldt ? osreldt : ppr->pr_osreldate;
@@ -2313,7 +2313,6 @@ sys_jail_remove(struct thread *td, struct jail_remove_args *uap)
 		}
 		mtx_lock(&pr->pr_mtx);
 	}
-
 	prison_remove_one(pr);
 	return (0);
 }
