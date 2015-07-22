@@ -357,7 +357,7 @@ do_execve(td, args, mac_p)
 	struct vnode *tracevp = NULL;
 	struct ucred *tracecred = NULL;
 #endif
-	struct vnode *textvp = NULL, *binvp;
+	struct vnode *oldtextvp = NULL, *newtextvp;
 	cap_rights_t rights;
 	int credential_changing;
 	int textset;
@@ -441,20 +441,20 @@ interpret:
 		if (error)
 			goto exec_fail;
 
-		binvp = nd.ni_vp;
-		imgp->vp = binvp;
+		newtextvp = nd.ni_vp;
+		imgp->vp = newtextvp;
 	} else {
 		AUDIT_ARG_FD(args->fd);
 		/*
 		 * Descriptors opened only with O_EXEC or O_RDONLY are allowed.
 		 */
 		error = fgetvp_exec(td, args->fd,
-		    cap_rights_init(&rights, CAP_FEXECVE), &binvp);
+		    cap_rights_init(&rights, CAP_FEXECVE), &newtextvp);
 		if (error)
 			goto exec_fail;
-		vn_lock(binvp, LK_EXCLUSIVE | LK_RETRY);
-		AUDIT_ARG_VNODE1(binvp);
-		imgp->vp = binvp;
+		vn_lock(newtextvp, LK_EXCLUSIVE | LK_RETRY);
+		AUDIT_ARG_VNODE1(newtextvp);
+		imgp->vp = newtextvp;
 	}
 
 #ifdef PAX_SEGVGUARD
@@ -547,13 +547,13 @@ interpret:
 		if (args->fname != NULL)
 			NDFREE(&nd, NDF_ONLY_PNBUF);
 #ifdef MAC
-		mac_execve_interpreter_enter(binvp, &interpvplabel);
+		mac_execve_interpreter_enter(newtextvp, &interpvplabel);
 #endif
 		if (imgp->opened) {
-			VOP_CLOSE(binvp, FREAD, td->td_ucred, td);
+			VOP_CLOSE(newtextvp, FREAD, td->td_ucred, td);
 			imgp->opened = 0;
 		}
-		vput(binvp);
+		vput(newtextvp);
 		vm_object_deallocate(imgp->object);
 		imgp->object = NULL;
 		/* set new name to that of the interpreter */
@@ -628,9 +628,6 @@ interpret:
 
 	vn_lock(imgp->vp, LK_SHARED | LK_RETRY);
 
-	/* Get a reference to the vnode prior to locking the proc */
-	VREF(binvp);
-
 	/*
 	 * For security and other reasons, signal handlers cannot
 	 * be shared after an exec. The new process gets a copy of the old
@@ -661,7 +658,7 @@ interpret:
 	if (args->fname)
 		bcopy(nd.ni_cnd.cn_nameptr, p->p_comm,
 		    min(nd.ni_cnd.cn_namelen, MAXCOMLEN));
-	else if (vn_commname(binvp, p->p_comm, sizeof(p->p_comm)) != 0)
+	else if (vn_commname(newtextvp, p->p_comm, sizeof(p->p_comm)) != 0)
 		bcopy(fexecv_proc_title, p->p_comm, sizeof(fexecv_proc_title));
 	bcopy(p->p_comm, td->td_name, sizeof(td->td_name));
 #ifdef KTR
@@ -795,11 +792,11 @@ interpret:
 	}
 
 	/*
-	 * Store the vp for use in procfs.  This vnode was referenced prior
-	 * to locking the proc lock.
+	 * Store the vp for use in procfs.  This vnode was referenced by namei
+	 * or fgetvp_exec.
 	 */
-	textvp = p->p_textvp;
-	p->p_textvp = binvp;
+	oldtextvp = p->p_textvp;
+	p->p_textvp = newtextvp;
 
 #ifdef KDTRACE_HOOKS
 	/*
@@ -876,10 +873,8 @@ done1:
 	/*
 	 * Handle deferred decrement of ref counts.
 	 */
-	if (textvp != NULL)
-		vrele(textvp);
-	if (error != 0)
-		vrele(binvp);
+	if (oldtextvp != NULL)
+		vrele(oldtextvp);
 #ifdef KTRACE
 	if (tracevp != NULL)
 		vrele(tracevp);
@@ -905,7 +900,10 @@ exec_fail_dealloc:
 			NDFREE(&nd, NDF_ONLY_PNBUF);
 		if (imgp->opened)
 			VOP_CLOSE(imgp->vp, FREAD, td->td_ucred, td);
-		vput(imgp->vp);
+		if (error != 0)
+			vput(imgp->vp);
+		else
+			VOP_UNLOCK(imgp->vp, 0);
 	}
 
 	if (imgp->object != NULL)
@@ -1092,24 +1090,16 @@ exec_new_vmspace(imgp, sv)
 		PROC_UNLOCK(imgp->proc);
 #endif
 		vm_object_reference(obj);
-		if (p->p_shared_page_base != sv->sv_shared_page_base) {
-			/* Only use vm_map_find if ASLR is active */
-			error = vm_map_find(map, obj, 0,
-			    &(p->p_shared_page_base), sv->sv_shared_page_len,
-			    sv->sv_shared_page_base,
-			    VMFS_ANY_SPACE,
-			    VM_PROT_READ | VM_PROT_EXECUTE,
-			    VM_PROT_READ | VM_PROT_EXECUTE,
-			    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
-		} else {
-			error = vm_map_fixed(map, obj, 0,
-			    p->p_shared_page_base, sv->sv_shared_page_len,
-			    VM_PROT_READ | VM_PROT_EXECUTE,
-			    VM_PROT_READ | VM_PROT_EXECUTE,
-			    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
-		}
+		error = vm_map_fixed(map, obj, 0,
+		    p->p_shared_page_base, sv->sv_shared_page_len,
+		    VM_PROT_READ | VM_PROT_EXECUTE,
+		    VM_PROT_READ | VM_PROT_EXECUTE,
+		    MAP_INHERIT_SHARE | MAP_ACC_NO_CHARGE);
 		if (error) {
 			vm_object_deallocate(obj);
+			pax_log_aslr(p, PAX_LOG_DEFAULT,
+			    "failed to map the shared-page @%p",
+			    (void *)p->p_shared_page_base);
 			return (error);
 		}
 	}
@@ -1145,8 +1135,12 @@ exec_new_vmspace(imgp, sv)
 	    obj != NULL && imgp->stack_prot != 0 ? imgp->stack_prot :
 		sv->sv_stackprot,
 	    VM_PROT_ALL, MAP_STACK_GROWS_DOWN);
-	if (error)
+	if (error) {
+		pax_log_aslr(p, PAX_LOG_DEFAULT,
+		    "failed to map the main stack @%p",
+		    (void *)p->p_usrstack);
 		return (error);
+	}
 
 	/*
 	 * vm_ssize and vm_maxsaddr are somewhat antiquated concepts, but they
